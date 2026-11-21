@@ -1,0 +1,1222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bomber Friends - Phase 2</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #1f2937; /* Tailwind gray-800 */
+            color: white;
+            margin: 0;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+        }
+
+        #game-container {
+            position: relative;
+            width: 600px; /* 15 tiles * 40px */
+            height: 440px; /* 11 tiles * 40px */
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            background-color: #4ade80; /* Grass green */
+            border-radius: 0.5rem;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
+        }
+
+        #ui-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background-color: rgba(0, 0, 0, 0.7);
+            border-radius: 0.5rem;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+
+        #ui-overlay.active {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        .hud {
+            position: absolute;
+            bottom: 100%;
+            margin-bottom: 0.5rem;
+            left: 0;
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+        }
+    </style>
+</head>
+<body>
+    <div id="game-container">
+        <div class="hud">
+            <div class="flex justify-between items-center">
+                <h1 class="text-xl font-bold text-gray-100 drop-shadow-md whitespace-nowrap">BOMBER FRIENDS</h1>
+                <div id="stat-hp" class="text-lg font-bold text-red-400 tracking-widest">&#9829;&#9829;&#9829;</div>
+            </div>
+            <div id="stats-panel" class="flex justify-between gap-3 text-xs font-semibold bg-gray-700 px-3 py-2 rounded-lg shadow-inner">
+                <div>Bombs: <span id="stat-bombs" class="text-blue-400">1/1</span></div>
+                <div>Range: <span id="stat-range" class="text-orange-400">2</span></div>
+                <div>Speed: <span id="stat-speed" class="text-green-400">100%</span></div>
+                <div>Shield: <span id="stat-shield" class="text-gray-400">Off</span></div>
+                <div>Key: <span id="stat-key" class="text-gray-400">No</span></div>
+            </div>
+        </div>
+
+        <canvas id="gameCanvas" width="600" height="440"></canvas>
+        
+        <div id="ui-overlay">
+            <h2 id="overlay-title" class="text-5xl font-extrabold text-red-500 mb-4 drop-shadow-[0_2px_2px_rgba(0,0,0,0.8)]">GAME OVER</h2>
+            <button id="restart-btn" class="bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 px-8 rounded-full shadow-lg transform transition hover:scale-105 active:scale-95">
+                Restart Game
+            </button>
+        </div>
+    </div>
+
+    <script>
+        const TILE_SIZE = 40;
+        const COLS = 15;
+        const ROWS = 11;
+        const CANVAS_WIDTH = COLS * TILE_SIZE;
+        const CANVAS_HEIGHT = ROWS * TILE_SIZE;
+
+        const TILE_EMPTY = 0;
+        const TILE_WALL = 1;
+        const TILE_BRICK = 2;
+
+        const PU_TYPES = ['BOMB_CAPACITY', 'FIRE_RANGE', 'SPEED_BOOST', 'SHIELD'];
+        const DROP_RATE = 0.35;
+// All timings are in seconds and are counted down with dt (never Date.now()),
+        // so a lag spike or hidden tab can't desync bombs, bricks and items.
+        const CHAIN_DELAY = 0.1;       // gap after a blast before bombs in range are triggered
+        const BRICK_BREAK_DELAY = 0.4; // fire touches brick -> brick breaks and drops item
+        const ITEM_BURN_DELAY = 0.4;   // fire touches item -> item is destroyed
+        const SLIDE_REACH = 28;        // max sideways distance (px) to a lane for corner sliding
+        const OBJECTIVE_MIN_DIST = 10; // key/door bricks are at least this many tiles (Manhattan) from the start
+        const EXIT_REACH = 16;         // px from the door's center to count as entering it
+        const SHIELD_DURATION = 8;     // seconds; the shield expires on its own and absorbs nothing
+        // Exit door: middle of the right edge (opposite the top-left spawn).
+        // For the bottom edge use { c: Math.floor(COLS / 2), r: ROWS - 1 }.
+        const EXIT_CELL = { c: COLS - 1, r: Math.floor(ROWS / 2) };
+
+        // Fixed simulation step. Bomb fuse = 4 s = exactly 480 ticks, whatever the frame rate.
+        const STEP = 1 / 120;
+        const TIMER_EPS = 1e-6;        // guards float error when comparing timers to 0
+        const BOMB_FUSE = 4;
+        const DIRS = [{dc:0, dr:-1}, {dc:0, dr:1}, {dc:-1, dr:0}, {dc:1, dr:0}];
+
+        // Health and damage
+        const PLAYER_MAX_HP = 3;
+        const BOMB_DAMAGE = 1;
+        const ENEMY_HP = 1;
+        const ENEMY_DAMAGE = 1;
+        const HURT_INVULN = 1.0;       // s of invulnerability after the player loses HP
+
+        // Enemies
+        const ENEMY_COUNTS = { neutral: 1, hostile: 1 };
+        const ENEMY_RADIUS = 12;
+        const ENEMY_STUN = 2.0;      // s an enemy stands still after damaging the player
+        const NEUTRAL_SPEED = 55;      // px/s
+        const HOSTILE_WANDER_SPEED = 70;
+        const HOSTILE_CHASE_SPEED = 100;
+        const LOSE_SIGHT_TIME = 1.0;   // s without a clear line before a hostile calms down
+        const ENEMY_MIN_SPAWN_DIST = 8; // tiles (Manhattan) from the player's start
+
+        // --- SPRITES: layered "paper doll" models ---
+        // The player, each monster type and the bomb are stacks of layers (face, shirt,
+        // eyes, mouth, necklace, glasses, hat...). A layer is a transparent
+        // SPRITE_RES x SPRITE_RES PNG at  asset/<model>/<layer>/<id>.png  and all
+        // layers of a model share the same canvas, so they line up when stacked.
+        // If a file is missing or not loaded yet, built-in vector art is used instead,
+        // so the game always renders. Set a part to null to leave that layer out.
+        const ASSET_ROOT = 'asset';    // folder next to this HTML file
+        const SPRITE_RES = 64;         // px size of every layer PNG (square)
+        const LAYER_ORDER = ['shirt', 'necklace', 'face', 'eyes', 'mouth', 'glasses', 'hat']; // back -> front
+
+        const MODELS = {
+            player: {
+                size: 44, // px it is drawn at in the game
+                layers: {
+                    shirt:    { id: 'basic', tint: '#3b82f6' },
+                    necklace: null,                         // e.g. { id: 'chain', tint: '#facc15' }
+                    face:     { id: 'round', tint: '#fcd9b6' },
+                    eyes:     { id: 'dot' },
+                    mouth:    { id: 'smile' },
+                    glasses:  null,                         // e.g. { id: 'round' }
+                    hat:      null                          // e.g. { id: 'cap', tint: '#ef4444' }
+                }
+            },
+            neutral: {
+                size: 38,
+                layers: {
+                    face:  { id: 'round', tint: '#a855f7' },
+                    eyes:  { id: 'dot' },
+                    mouth: { id: 'flat' }
+                }
+            },
+            hostile: {
+                size: 38,
+                layers: {
+                    face:  { id: 'round', tint: '#dc2626' },
+                    eyes:  { id: 'angry' },
+                    mouth: { id: 'fangs' }
+                }
+            },
+            bomb: {
+                size: 46,
+                order: ['body', 'fuse'], // a model can define its own layers/order
+                layers: {
+                    body: { id: 'classic' },
+                    fuse: { id: 'classic' }
+                }
+            }
+        };
+
+        // Built-in art, drawn on the same 64x64 grid the PNG layers use.
+        function drawFallbackLayer(g, layer, part) {
+            const id = part.id, tint = part.tint;
+            const TAU = Math.PI * 2;
+            g.save();
+            g.lineCap = 'round';
+            switch (layer) {
+                case 'shirt':
+                    g.fillStyle = tint || '#3b82f6';
+                    g.beginPath(); g.ellipse(32, 52, 20, 11, 0, 0, TAU); g.fill();
+                    break;
+                case 'necklace':
+                    g.strokeStyle = tint || '#facc15'; g.lineWidth = 3;
+                    g.beginPath(); g.arc(32, 40, 13, Math.PI * 0.15, Math.PI * 0.85); g.stroke();
+                    break;
+                case 'face':
+                    g.fillStyle = tint || '#fcd9b6';
+                    g.beginPath(); g.arc(32, 26, 20, 0, TAU); g.fill();
+                    g.strokeStyle = 'rgba(0,0,0,0.35)'; g.lineWidth = 2; g.stroke();
+                    break;
+                case 'eyes':
+                    g.fillStyle = '#111';
+                    for (const ex of [24, 40]) { g.beginPath(); g.arc(ex, 25, 3.5, 0, TAU); g.fill(); }
+                    if (id === 'angry') { // slanted brows
+                        g.strokeStyle = '#111'; g.lineWidth = 3; g.beginPath();
+                        g.moveTo(18, 16); g.lineTo(29, 21); g.moveTo(46, 16); g.lineTo(35, 21);
+                        g.stroke();
+                    }
+                    break;
+                case 'mouth':
+                    g.strokeStyle = '#111'; g.lineWidth = 3; g.beginPath();
+                    if (id === 'flat') { g.moveTo(25, 36); g.lineTo(39, 36); g.stroke(); }
+                    else if (id === 'fangs') {
+                        g.moveTo(24, 35); g.lineTo(40, 35); g.stroke();
+                        g.fillStyle = '#fff';
+                        for (const fx of [27, 37]) {
+                            g.beginPath(); g.moveTo(fx - 3, 35); g.lineTo(fx + 3, 35); g.lineTo(fx, 42); g.closePath(); g.fill();
+                        }
+                    } else { g.arc(32, 30, 8, Math.PI * 0.15, Math.PI * 0.85); g.stroke(); }
+                    break;
+                case 'glasses':
+                    g.strokeStyle = tint || '#111'; g.lineWidth = 2.5;
+                    for (const ex of [24, 40]) { g.beginPath(); g.arc(ex, 25, 7.5, 0, TAU); g.stroke(); }
+                    g.beginPath(); g.moveTo(31, 25); g.lineTo(33, 25); g.stroke();
+                    break;
+                case 'hat':
+                    g.fillStyle = tint || '#ef4444';
+                    g.beginPath(); g.ellipse(32, 16, 19, 13, 0, Math.PI, 0); g.closePath(); g.fill();
+                    g.fillRect(10, 15, 44, 4);
+                    break;
+                case 'body': // bomb
+                    g.fillStyle = tint || '#111';
+                    g.beginPath(); g.arc(32, 36, 20, 0, TAU); g.fill();
+                    g.fillStyle = 'rgba(255,255,255,0.35)';
+                    g.beginPath(); g.arc(25, 29, 5, 0, TAU); g.fill();
+                    break;
+                case 'fuse': // bomb
+                    g.strokeStyle = '#a16207'; g.lineWidth = 4;
+                    g.beginPath(); g.moveTo(38, 18); g.quadraticCurveTo(46, 14, 46, 8); g.stroke();
+                    g.fillStyle = '#fb923c';
+                    g.beginPath(); g.arc(46, 7, 4, 0, TAU); g.fill();
+                    break;
+            }
+            g.restore();
+        }
+
+        class SpriteStore {
+            constructor(models) {
+                this.models = models;
+                this.images = {};   // url -> { img, state: 'loading' | 'ok' | 'missing' }
+                this.cache = {};    // model name -> composed canvas
+                this.scratch = null; // canvas used for tinting
+                this.dirty = new Set(Object.keys(models));
+                // Start fetching every file right away
+                for (const name of Object.keys(models)) {
+                    for (const [layer, part] of Object.entries(models[name].layers)) {
+                        if (part) this.load(this.urlOf(name, layer, part));
+                    }
+                }
+            }
+
+            // A part may give its own `src` (any URL or a data: URI) instead of the default path
+            urlOf(model, layer, part) {
+                if (model === 'neutral' || model === 'hostile') {
+                    return part.src || `${ASSET_ROOT}/enemy/${model}/${layer}/${part.id}.png`;
+                }
+                return part.src || `${ASSET_ROOT}/${model}/${layer}/${part.id}.png`;
+            }
+
+            load(url) {
+                if (this.images[url]) return this.images[url];
+                const entry = { img: new Image(), state: 'loading' };
+                entry.img.onload = () => { entry.state = 'ok'; this.markAllDirty(); };
+                entry.img.onerror = () => {
+                    entry.state = 'missing';
+                    console.info(`[sprites] ${url} not found - using built-in art`);
+                };
+                entry.img.src = url;
+                this.images[url] = entry;
+                return entry;
+            }
+
+            markAllDirty() { this.dirty = new Set(Object.keys(this.models)); }
+
+            // Change a part at runtime, e.g. sprites.setPart('player', 'hat', { id: 'cap', tint: '#ef4444' })
+            // (pass null to remove it)
+            setPart(model, layer, part) {
+                this.models[model].layers[layer] = part;
+                this.dirty.add(model);
+            }
+
+            drawImageLayer(g, img, tint) {
+                if (!tint) { g.drawImage(img, 0, 0, SPRITE_RES, SPRITE_RES); return; }
+                // Recolor: multiply by the tint, then keep only the original shape
+                if (!this.scratch) {
+                    this.scratch = document.createElement('canvas');
+                    this.scratch.width = this.scratch.height = SPRITE_RES;
+                }
+                const t = this.scratch.getContext('2d');
+                t.globalCompositeOperation = 'source-over';
+                t.clearRect(0, 0, SPRITE_RES, SPRITE_RES);
+                t.drawImage(img, 0, 0, SPRITE_RES, SPRITE_RES);
+                t.globalCompositeOperation = 'multiply';
+                t.fillStyle = tint;
+                t.fillRect(0, 0, SPRITE_RES, SPRITE_RES);
+                t.globalCompositeOperation = 'destination-in';
+                t.drawImage(img, 0, 0, SPRITE_RES, SPRITE_RES);
+                t.globalCompositeOperation = 'source-over';
+                g.drawImage(this.scratch, 0, 0);
+            }
+
+            compose(name) {
+                const model = this.models[name];
+                let cv = this.cache[name];
+                if (!cv) {
+                    cv = document.createElement('canvas');
+                    cv.width = cv.height = SPRITE_RES;
+                    this.cache[name] = cv;
+                }
+                const g = cv.getContext('2d');
+                g.clearRect(0, 0, SPRITE_RES, SPRITE_RES);
+                for (const layer of (model.order || LAYER_ORDER)) {
+                    const part = model.layers[layer];
+                    if (!part) continue;
+                    const entry = this.load(this.urlOf(name, layer, part));
+                    if (entry.state === 'ok') this.drawImageLayer(g, entry.img, part.tint);
+                    else drawFallbackLayer(g, layer, part); // still loading, or no file
+                }
+            }
+
+            // The layers are composited once into a cache and re-composited only when
+            // something changes (a file finished loading, or setPart was called).
+            draw(ctx, name, x, y, scale = 1) {
+                if (this.dirty.has(name)) {
+                    this.compose(name);
+                    this.dirty.delete(name);
+                }
+                const s = this.models[name].size * scale;
+                ctx.drawImage(this.cache[name], x - s / 2, y - s / 2, s, s);
+            }
+        }
+
+        const sprites = new SpriteStore(MODELS);
+        window.sprites = sprites; // handy for trying parts from the browser console
+
+        class Enemy {
+            constructor(type, c, r) {
+                this.type = type;
+                this.hp = ENEMY_HP;
+                this.x = c * TILE_SIZE + 20;
+                this.y = r * TILE_SIZE + 20;
+                this.c = c;
+                this.r = r;
+                this.tc = c;
+                this.tr = r;
+                this.dir = null;
+                this.stun = 0;
+                this.wait = 0;
+                this.aggro = false;
+                this.lostTimer = 0;
+            }
+
+            getSpeed() {
+                if (this.type === 'neutral') return NEUTRAL_SPEED;
+                return this.aggro ? HOSTILE_CHASE_SPEED : HOSTILE_WANDER_SPEED;
+            }
+        }
+
+        // --- INPUT ---
+        const keys = {};
+        const prevKeys = {};
+        window.addEventListener('keydown', e => keys[e.code] = true);
+        window.addEventListener('keyup', e => keys[e.code] = false);
+
+        function isJustPressed(code) {
+            return keys[code] && !prevKeys[code];
+        }
+
+        // --- MAP ---
+        class Map {
+            constructor() {
+                this.grid = [];
+                this.generate();
+            }
+
+            generate() {
+                for (let x = 0; x < COLS; x++) {
+                    this.grid[x] = [];
+                    for (let y = 0; y < ROWS; y++) {
+                        // Indestructible walls at odd coordinates
+                        if (x % 2 !== 0 && y % 2 !== 0) {
+                            this.grid[x][y] = TILE_WALL;
+                        } 
+                        // Safe zone top-left
+                        else if (x <= 1 && y <= 1) {
+                            this.grid[x][y] = TILE_EMPTY;
+                        } else if (x === 2 && y === 0 || x === 0 && y === 2) {
+                            this.grid[x][y] = TILE_EMPTY; 
+                        }
+                        // Breakable bricks
+                        else {
+                            this.grid[x][y] = Math.random() < 0.4 ? TILE_BRICK : TILE_EMPTY;
+                        }
+                    }
+                }
+            }
+
+            isSolid(c, r) {
+                if (c < 0 || c >= COLS || r < 0 || r >= ROWS) return true;
+                return this.grid[c][r] !== TILE_EMPTY;
+            }
+
+            draw(ctx) {
+                for (let x = 0; x < COLS; x++) {
+                    for (let y = 0; y < ROWS; y++) {
+                        const px = x * TILE_SIZE;
+                        const py = y * TILE_SIZE;
+                        const tile = this.grid[x][y];
+
+                        if (tile === TILE_WALL) {
+                            ctx.fillStyle = '#374151';
+                            ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+                        } else if (tile === TILE_BRICK) {
+                            ctx.fillStyle = '#92400e';
+                            ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+                            // Simple texture
+                            ctx.fillStyle = '#78350f';
+                            ctx.fillRect(px, py + 18, TILE_SIZE, 4);
+                            ctx.fillRect(px + 18, py, 4, 18);
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- GAME LOGIC ---
+        class Game {
+            constructor() {
+                this.canvas = document.getElementById('gameCanvas');
+                this.ctx = this.canvas.getContext('2d');
+                this.map = new Map();
+                
+                this.bombs = [];
+                this.fires = [];
+                this.powerUps = [];
+                this.burningBricks = []; // Bricks waiting to break
+                
+                this.player = this.initPlayer();
+                this.isGameOver = false;
+                this.isWon = false;
+                this.placeObjectives();
+                this.spawnEnemies();
+                
+                document.getElementById('restart-btn').addEventListener('click', (e) => {
+                    e.currentTarget.blur(); // Otherwise Space (place bomb) would re-click the button
+                    this.restart();
+                });
+                this.updateUI();
+                
+                this.lastTime = performance.now();
+                this.accumulator = 0;
+                requestAnimationFrame(t => this.loop(t));
+            }
+
+            initPlayer() {
+                return {
+                    x: TILE_SIZE / 2,
+                    y: TILE_SIZE / 2,
+                    hitboxRadius: 14, // Slightly smaller than half tile for corner sliding
+                    baseSpeed: 130, // px per second
+                    stats: {
+                        maxBombs: 1,
+                        fireRange: 2,
+                        speedMultiplier: 1.0,
+                        shieldTimer: 0 // Seconds of shield left (0 = off)
+                    },
+                    hp: PLAYER_MAX_HP,
+                    invulnTimer: 0 // Hurt invulnerability (seconds)
+                };
+            }
+
+            restart() {
+                this.map.generate();
+                this.bombs = [];
+                this.fires = [];
+                this.powerUps = [];
+                this.burningBricks = [];
+                this.player = this.initPlayer();
+                this.isGameOver = false;
+                this.isWon = false;
+                this.placeObjectives();
+                this.spawnEnemies();
+                document.getElementById('ui-overlay').classList.remove('active');
+                this.updateUI();
+                this.lastTime = performance.now();
+                this.accumulator = 0;
+            }
+
+            // The exit door has a fixed spot (EXIT_CELL: middle of the edge opposite
+            // the spawn) and is never buried under a brick. Only the key is hidden
+            // under a brick, somewhere far from the player's start.
+            placeObjectives() {
+                this.door = { c: EXIT_CELL.c, r: EXIT_CELL.r };
+                this.map.grid[this.door.c][this.door.r] = TILE_EMPTY;
+
+                const startC = Math.floor(this.player.x / TILE_SIZE);
+                const startR = Math.floor(this.player.y / TILE_SIZE);
+                const bricks = [];
+                for (let c = 0; c < COLS; c++) {
+                    for (let r = 0; r < ROWS; r++) {
+                        if (this.map.grid[c][r] === TILE_BRICK) {
+                            bricks.push({ c, r, dist: Math.abs(c - startC) + Math.abs(r - startR) });
+                        }
+                    }
+                }
+                let pool = bricks.filter(b => b.dist >= OBJECTIVE_MIN_DIST);
+                if (pool.length === 0) {
+                    // Very rare, but a generated map can contain no brick tiles.
+                    const openCells = [];
+                    for (let c = 0; c < COLS; c++) {
+                        for (let r = 0; r < ROWS; r++) {
+                            if (!this.map.isSolid(c, r) && !(c === this.door.c && r === this.door.r)) {
+                                openCells.push({
+                                    c, r,
+                                    dist: Math.abs(c - startC) + Math.abs(r - startR)
+                                });
+                            }
+                        }
+                    }
+                    openCells.sort((a, b) => b.dist - a.dist);
+                    const fallback = openCells[0];
+                    this.key = fallback
+                        ? { c: fallback.c, r: fallback.r, dropped: true }
+                        : { c: 0, r: 0, dropped: true };
+                    this.hasKey = false;
+                    return;
+                }
+                const k = pool[Math.floor(Math.random() * pool.length)];
+                this.key = { c: k.c, r: k.r, dropped: false };
+                this.hasKey = false;
+            }
+
+            checkObjectives() {
+                const p = this.player;
+                const center = (cell) => ({ x: cell.c * TILE_SIZE + 20, y: cell.r * TILE_SIZE + 20 });
+
+                if (!this.hasKey && this.key.dropped) {
+                    const k = center(this.key);
+                    if (Math.hypot(p.x - k.x, p.y - k.y) < 24) {
+                        this.hasKey = true;
+                        this.updateUI();
+                    }
+                }
+
+                if (this.hasKey && this.map.grid[this.door.c][this.door.r] !== TILE_BRICK) {
+                    const d = center(this.door);
+                    if (Math.hypot(p.x - d.x, p.y - d.y) < EXIT_REACH) {
+                        this.isWon = true;
+                        this.showEndScreen(true);
+                    }
+                }
+            }
+
+            showEndScreen(won) {
+                const title = document.getElementById('overlay-title');
+                title.textContent = won ? 'YOU WIN!' : 'GAME OVER';
+                title.style.color = won ? '#4ade80' : '#ef4444';
+                document.getElementById('restart-btn').textContent = won ? 'New Game' : 'Restart Game';
+                document.getElementById('ui-overlay').classList.add('active');
+            }
+
+            updateUI() {
+                const hp = Math.max(0, this.player.hp);
+                document.getElementById('stat-hp').textContent =
+                    '\u2665'.repeat(hp) + '\u2661'.repeat(PLAYER_MAX_HP - hp);
+
+                const activeBombs = this.bombs.filter(b => b.owner === this.player).length;
+                const pStats = this.player.stats;
+                
+                document.getElementById('stat-bombs').textContent = `${pStats.maxBombs - activeBombs}/${pStats.maxBombs}`;
+                document.getElementById('stat-range').textContent = pStats.fireRange;
+                document.getElementById('stat-speed').textContent = `${Math.round(pStats.speedMultiplier * 100)}%`;
+                
+                const shieldEl = document.getElementById('stat-shield');
+                const shieldLeft = Math.ceil(pStats.shieldTimer);
+                this.shieldShown = shieldLeft;
+                shieldEl.textContent = shieldLeft > 0 ? `${shieldLeft}s` : 'Off';
+                shieldEl.className = shieldLeft > 0 ? 'text-yellow-400' : 'text-gray-400';
+
+                const keyEl = document.getElementById('stat-key');
+                keyEl.textContent = this.hasKey ? 'Found' : 'No';
+                keyEl.className = this.hasKey ? 'text-yellow-400' : 'text-gray-400';
+            }
+
+            // --- AXIS-INDEPENDENT MOVEMENT & COLLISION ---
+            // Returns true while the player's hitbox still overlaps the bomb's tile.
+            // This is more reliable than checking center-to-center distance.
+            playerOverlapsBombTile(b, playerX = this.player.x, playerY = this.player.y) {
+                const left = Math.floor((playerX - this.player.hitboxRadius) / TILE_SIZE);
+                const right = Math.floor((playerX + this.player.hitboxRadius) / TILE_SIZE);
+                const top = Math.floor((playerY - this.player.hitboxRadius) / TILE_SIZE);
+                const bottom = Math.floor((playerY + this.player.hitboxRadius) / TILE_SIZE);
+
+                return b.c >= left && b.c <= right && b.r >= top && b.r <= bottom;
+            }
+
+            checkPlayerCollision(newX, newY) {
+                const left = Math.floor((newX - this.player.hitboxRadius) / TILE_SIZE);
+                const right = Math.floor((newX + this.player.hitboxRadius) / TILE_SIZE);
+                const top = Math.floor((newY - this.player.hitboxRadius) / TILE_SIZE);
+                const bottom = Math.floor((newY + this.player.hitboxRadius) / TILE_SIZE);
+
+                for (let c = left; c <= right; c++) {
+                    for (let r = top; r <= bottom; r++) {
+                        // Check wall/brick
+                        if (this.map.isSolid(c, r)) return true;
+                        
+                        // Check bombs (allow player to walk off the bomb they just placed)
+                        for (let b of this.bombs) {
+                            // The owner may leave the bomb tile, but only while
+                            // their hitbox is still overlapping that tile.
+                            const ownerStillOverlapping = b.playerInside &&
+                                b.owner === this.player &&
+                                this.playerOverlapsBombTile(b, newX, newY);
+
+                            if (b.c === c && b.r === r && !ownerStillOverlapping) {
+                                return true; // Bomb is solid
+                            }
+                        }
+                    }
+                }
+                return false;
+            }
+
+            // Moves along one axis. If a tile corner blocks the move, the player is
+            // nudged toward the free lane so they slide around the corner.
+            moveAxis(axis, amount) {
+                if (amount === 0) return;
+                const p = this.player;
+                const side = axis === 'x' ? 'y' : 'x';
+
+                p[axis] += amount;
+                if (!this.checkPlayerCollision(p.x, p.y)) return;
+                p[axis] -= amount;
+
+                p[side] += this.getSlideNudge(axis, amount);
+            }
+
+            // Returns how far to shift on the perpendicular axis (0 = no slide).
+            getSlideNudge(axis, amount) {
+                const p = this.player;
+                const side = axis === 'x' ? 'y' : 'x';
+                const pos = p[side];
+                const ownLane = Math.floor(pos / TILE_SIZE);
+                const lean = pos >= ownLane * TILE_SIZE + TILE_SIZE / 2 ? 1 : -1;
+
+                // Try the lane the player's center is in, then the one they lean toward
+                for (const lane of [ownLane, ownLane + lean]) {
+                    const center = lane * TILE_SIZE + TILE_SIZE / 2;
+                    const off = center - pos;
+                    if (off === 0 || Math.abs(off) > SLIDE_REACH) continue;
+
+                    // The way ahead must be free once fully aligned with this lane
+                    const aheadX = axis === 'x' ? p.x + amount : center;
+                    const aheadY = axis === 'x' ? center : p.y + amount;
+                    if (this.checkPlayerCollision(aheadX, aheadY)) continue;
+
+                    // Slide at most one movement step, and never into something solid
+                    const move = Math.sign(off) * Math.min(Math.abs(off), Math.abs(amount));
+                    const nx = axis === 'x' ? p.x : p.x + move;
+                    const ny = axis === 'x' ? p.y + move : p.y;
+                    if (!this.checkPlayerCollision(nx, ny)) return move;
+                }
+                return 0;
+            }
+
+            // Single entry point for all damage to the player. An active shield or the
+            // short invulnerability after a hit blocks it. Returns true if HP was lost.
+            damagePlayer(amount) {
+                const p = this.player;
+                if (this.isGameOver || p.stats.shieldTimer > 0 || p.invulnTimer > 0) return false;
+                p.hp -= amount;
+                p.invulnTimer = HURT_INVULN;
+                this.updateUI();
+                if (p.hp <= 0) {
+                    this.isGameOver = true;
+                    this.showEndScreen(false);
+                }
+                return true;
+            }
+
+            // --- ENEMIES ---
+            // They move tile to tile, so they can never pass walls, bricks or bombs.
+            isBlockedTile(c, r) {
+                return this.map.isSolid(c, r) || this.bombs.some(b => b.c === c && b.r === r);
+            }
+
+            spawnEnemies() {
+                this.enemies = [];
+                const startC = Math.floor(this.player.x / TILE_SIZE);
+                const startR = Math.floor(this.player.y / TILE_SIZE);
+                const spots = [];
+                for (let c = 0; c < COLS; c++) {
+                    for (let r = 0; r < ROWS; r++) {
+                        if (this.map.isSolid(c, r)) continue;
+                        if (Math.abs(c - startC) + Math.abs(r - startR) < ENEMY_MIN_SPAWN_DIST) continue;
+                        if (c === this.door.c && r === this.door.r) continue;
+                        if (!DIRS.some(d => !this.map.isSolid(c + d.dc, r + d.dr))) continue; // Walled in
+                        spots.push({ c, r });
+                    }
+                }
+                for (const type of Object.keys(ENEMY_COUNTS)) {
+                    for (let i = 0; i < ENEMY_COUNTS[type] && spots.length > 0; i++) {
+                        const s = spots.splice(Math.floor(Math.random() * spots.length), 1)[0];
+                        this.enemies.push(new Enemy(type, s.c, s.r));
+                    }
+                }
+            }
+
+            // True when the player is on the same row/column as the monster with no
+            // wall, brick or bomb on the tiles in between.
+            canSeePlayer(m) {
+                const mc = Math.floor(m.x / TILE_SIZE), mr = Math.floor(m.y / TILE_SIZE);
+                const pc = Math.floor(this.player.x / TILE_SIZE), pr = Math.floor(this.player.y / TILE_SIZE);
+                if (mc !== pc && mr !== pr) return false;
+                const dc = Math.sign(pc - mc), dr = Math.sign(pr - mr);
+                let c = mc + dc, r = mr + dr;
+                while (c !== pc || r !== pr) {
+                    if (this.isBlockedTile(c, r)) return false;
+                    c += dc;
+                    r += dr;
+                }
+                return true;
+            }
+
+            chooseEnemyTarget(m) {
+                const free = DIRS.filter(d => !this.isBlockedTile(m.c + d.dc, m.r + d.dr));
+                if (free.length === 0) { // Boxed in: wait a moment and look again
+                    m.dir = null; m.tc = m.c; m.tr = m.r; m.wait = 0.25;
+                    return;
+                }
+
+                let pick = null;
+                if (m.type === 'hostile' && m.aggro) {
+                    // Chase: step toward the player, longer axis first
+                    const pc = Math.floor(this.player.x / TILE_SIZE);
+                    const pr = Math.floor(this.player.y / TILE_SIZE);
+                    const dc = Math.sign(pc - m.c), dr = Math.sign(pr - m.r);
+                    const horizontal = { dc, dr: 0 }, vertical = { dc: 0, dr };
+                    const order = Math.abs(pc - m.c) >= Math.abs(pr - m.r)
+                        ? [horizontal, vertical] : [vertical, horizontal];
+                    pick = order.find(w => (w.dc || w.dr) &&
+                        free.some(f => f.dc === w.dc && f.dr === w.dr)) || null;
+                }
+
+                if (!pick) { // Random walk: no U-turns unless it's the only way, favors going straight
+                    let options = free;
+                    if (m.dir) {
+                        const noReverse = free.filter(d => !(d.dc === -m.dir.dc && d.dr === -m.dir.dr));
+                        if (noReverse.length > 0) options = noReverse;
+                        const ahead = options.find(d => d.dc === m.dir.dc && d.dr === m.dir.dr);
+                        if (ahead && Math.random() < 0.6) pick = ahead;
+                    }
+                    if (!pick) pick = options[Math.floor(Math.random() * options.length)];
+                }
+
+                m.dir = pick;
+                m.tc = m.c + pick.dc;
+                m.tr = m.r + pick.dr;
+            }
+
+            moveEnemy(m, dt) {
+                // A bomb was dropped on the tile it is heading to: turn back
+                if ((m.tc !== m.c || m.tr !== m.r) &&
+                    this.bombs.some(b => b.c === m.tc && b.r === m.tr)) {
+                    m.tc = m.c;
+                    m.tr = m.r;
+                }
+
+                const speed = m.getSpeed();
+                const tx = m.tc * TILE_SIZE + 20, ty = m.tr * TILE_SIZE + 20;
+                const dx = tx - m.x, dy = ty - m.y;
+                const dist = Math.hypot(dx, dy);
+                const step = speed * dt;
+
+                if (dist <= step) { // Arrived: snap to the tile center and pick the next tile
+                    m.x = tx; m.y = ty;
+                    m.c = m.tc; m.r = m.tr;
+                    this.chooseEnemyTarget(m);
+                } else {
+                    m.x += dx / dist * step;
+                    m.y += dy / dist * step;
+                }
+            }
+
+            updateEnemies(dt) {
+                const p = this.player;
+                for (const m of this.enemies) {
+                    // After dealing damage it stands still (and harmless) for ENEMY_STUN s
+                    if (m.stun > 0) {
+                        m.stun = Math.max(0, m.stun - dt);
+                        continue;
+                    }
+
+                    // Hostile: sees the player along a clear straight line -> hostile.
+                    // Loses interest after LOSE_SIGHT_TIME s without that line.
+                    if (m.type === 'hostile') {
+                        if (this.canSeePlayer(m)) {
+                            m.aggro = true;
+                            m.lostTimer = 0;
+                        } else if (m.aggro) {
+                            m.lostTimer += dt;
+                            if (m.lostTimer >= LOSE_SIGHT_TIME - TIMER_EPS) m.aggro = false;
+                        }
+                    }
+
+                    if (m.wait > 0) m.wait -= dt;
+                    else this.moveEnemy(m, dt);
+
+                    // Contact damage (blocked by shield / hurt-invulnerability, then no stun)
+                    if (Math.hypot(p.x - m.x, p.y - m.y) < p.hitboxRadius + ENEMY_RADIUS) {
+                        if (this.damagePlayer(ENEMY_DAMAGE)) m.stun = ENEMY_STUN;
+                    }
+                }
+            }
+
+            updatePlayer(dt) {
+                if (this.player.invulnTimer > 0) {
+                    this.player.invulnTimer = Math.max(0, this.player.invulnTimer - dt);
+                }
+                const st = this.player.stats;
+                if (st.shieldTimer > 0) {
+                    st.shieldTimer = Math.max(0, st.shieldTimer - dt);
+                    // Refresh the HUD only when the displayed second changes
+                    if (Math.ceil(st.shieldTimer) !== this.shieldShown) this.updateUI();
+                }
+
+                const speed = this.player.baseSpeed * this.player.stats.speedMultiplier;
+                let dx = 0;
+                let dy = 0;
+
+                if (keys['KeyW'] || keys['ArrowUp']) dy -= speed * dt;
+                if (keys['KeyS'] || keys['ArrowDown']) dy += speed * dt;
+                if (keys['KeyA'] || keys['ArrowLeft']) dx -= speed * dt;
+                if (keys['KeyD'] || keys['ArrowRight']) dx += speed * dt;
+
+                // Normalize diagonal
+                if (dx !== 0 && dy !== 0) {
+                    const len = Math.hypot(dx, dy);
+                    dx = (dx / len) * speed * dt;
+                    dy = (dy / len) * speed * dt;
+                }
+
+                this.moveAxis('x', dx);
+                this.moveAxis('y', dy);
+
+                // Clamp to screen bounds
+                this.player.x = Math.max(this.player.hitboxRadius, Math.min(CANVAS_WIDTH - this.player.hitboxRadius, this.player.x));
+                this.player.y = Math.max(this.player.hitboxRadius, Math.min(CANVAS_HEIGHT - this.player.hitboxRadius, this.player.y));
+
+                // Check powerup collection
+                for (let i = this.powerUps.length - 1; i >= 0; i--) {
+                    const pu = this.powerUps[i];
+                    if (Math.hypot(this.player.x - (pu.c * TILE_SIZE + 20), this.player.y - (pu.r * TILE_SIZE + 20)) < 24) {
+                        this.collectPowerUp(pu);
+                        this.powerUps.splice(i, 1);
+                    }
+                }
+            }
+
+            collectPowerUp(pu) {
+                switch(pu.type) {
+                    case 'BOMB_CAPACITY':
+                        this.player.stats.maxBombs = Math.min(this.player.stats.maxBombs + 1, 5);
+                        break;
+                    case 'FIRE_RANGE':
+                        this.player.stats.fireRange = Math.min(this.player.stats.fireRange + 1, 6);
+                        break;
+                    case 'SPEED_BOOST':
+                        this.player.stats.speedMultiplier = Math.min(this.player.stats.speedMultiplier + 0.15, 1.75);
+                        break;
+                    case 'SHIELD':
+                        this.player.stats.shieldTimer = SHIELD_DURATION; // Picking up another refreshes it
+                        break;
+                }
+                this.updateUI();
+            }
+
+            placeBomb() {
+                const activeBombs = this.bombs.filter(b => b.owner === this.player).length;
+                if (activeBombs >= this.player.stats.maxBombs) return;
+
+                const c = Math.floor(this.player.x / TILE_SIZE);
+                const r = Math.floor(this.player.y / TILE_SIZE);
+
+                // Check if bomb already here
+                if (this.bombs.some(b => b.c === c && b.r === r)) return;
+
+                this.bombs.push({
+                    c, r,
+                    timer: BOMB_FUSE, // Exactly 4 s of game time
+                    owner: this.player,
+                    playerInside: true, // Allow player to walk off
+                    range: this.player.stats.fireRange
+                });
+                this.updateUI();
+            }
+
+            spawnPowerUp(c, r) {
+                if (Math.random() <= DROP_RATE) {
+                    const type = PU_TYPES[Math.floor(Math.random() * PU_TYPES.length)];
+                    this.powerUps.push({
+                        c, r, type,
+                        burnTimer: null // Becomes a countdown once fire touches it
+                    });
+                }
+            }
+
+            createExplosion(bomb) {
+                const directions = [{dc:0, dr:-1}, {dc:0, dr:1}, {dc:-1, dr:0}, {dc:1, dr:0}];
+                const cells = [{c: bomb.c, r: bomb.r}]; // Center
+
+                for (let dir of directions) {
+                    for (let i = 1; i <= bomb.range; i++) {
+                        const nc = bomb.c + dir.dc * i;
+                        const nr = bomb.r + dir.dr * i;
+
+                        if (nc < 0 || nc >= COLS || nr < 0 || nr >= ROWS) break;
+
+                        const tile = this.map.grid[nc][nr];
+                        if (tile === TILE_WALL) break;
+
+                        cells.push({c: nc, r: nr});
+                        if (tile === TILE_BRICK) {
+                            this.igniteBrick(nc, nr); // Breaks later, not now
+                            break; // Stop explosion in this dir
+                        }
+                    }
+                }
+
+                // Chain reaction: bombs caught in this blast go off CHAIN_DELAY later.
+                // Each generation waits for the one before it, so the chain travels
+                // outward from the bomb that started it.
+                for (const other of this.bombs) {
+                    if (cells.some(cell => cell.c === other.c && cell.r === other.r)) {
+                        other.timer = Math.min(other.timer, CHAIN_DELAY);
+                    }
+                }
+
+                this.fires.push({
+                    cells,
+                    timer: 0.3, // Fire lingers for 300ms
+                    hurt: new Set() // Monsters this explosion has already hit
+                });
+            }
+
+            igniteBrick(c, r) {
+                // A brick already burning keeps its original countdown
+                if (this.burningBricks.some(b => b.c === c && b.r === r)) return;
+                this.burningBricks.push({ c, r, timer: BRICK_BREAK_DELAY });
+            }
+
+            update(dt) {
+                if (this.isGameOver || this.isWon) return;
+
+                if (isJustPressed('Space')) this.placeBomb();
+
+                this.updatePlayer(dt);
+                this.checkObjectives();
+                if (this.isWon) return;
+                this.updateEnemies(dt);
+
+                // --- Bombs: timers count down with dt only ---
+                const due = [];
+                for (let i = this.bombs.length - 1; i >= 0; i--) {
+                    const b = this.bombs[i];
+                    b.timer -= dt;
+
+                    // Release the owner only after their entire hitbox has
+                    // cleared the bomb tile. This avoids trapping them at the edge.
+                    if (b.playerInside && b.owner === this.player &&
+                        !this.playerOverlapsBombTile(b)) {
+                        b.playerInside = false;
+                    }
+
+                    if (b.timer <= TIMER_EPS) {
+                        due.push(b);
+                        this.bombs.splice(i, 1);
+                    }
+                }
+                // Explode after the countdown pass, so bombs chained by these blasts
+                // keep their full CHAIN_DELAY instead of losing part of it this frame.
+                for (const b of due) this.createExplosion(b);
+                if (due.length) this.updateUI();
+
+                // --- Power-ups: burning countdown ---
+                for (let i = this.powerUps.length - 1; i >= 0; i--) {
+                    const pu = this.powerUps[i];
+                    if (pu.burnTimer !== null) {
+                        pu.burnTimer -= dt;
+                        if (pu.burnTimer <= 0) this.powerUps.splice(i, 1);
+                    }
+                }
+
+                // --- Fires: burn the player, ignite power-ups ---
+                for (let i = this.fires.length - 1; i >= 0; i--) {
+                    const f = this.fires[i];
+                    f.timer -= dt;
+
+                    if (f.timer <= 0) {
+                        this.fires.splice(i, 1);
+                        continue;
+                    }
+
+                    for (let cell of f.cells) {
+                        // Player touching fire
+                        const px = this.player.x;
+                        const py = this.player.y;
+                        const cx = cell.c * TILE_SIZE + 20;
+                        const cy = cell.r * TILE_SIZE + 20;
+
+                        // Bomb damage (shield / hurt-invulnerability are handled inside)
+                        if (Math.hypot(px - cx, py - cy) < 30) this.damagePlayer(BOMB_DAMAGE);
+
+// Fire hurts each monster at most once per explosion
+                        for (const m of this.enemies) {
+                            if (!f.hurt.has(m) &&
+                                Math.floor(m.x / TILE_SIZE) === cell.c &&
+                                Math.floor(m.y / TILE_SIZE) === cell.r) {
+                                f.hurt.add(m);
+                                m.hp -= BOMB_DAMAGE;
+                            }
+                        }
+
+                        
+                        // Fire starts the burn countdown on power-ups (once)
+                        for (const pu of this.powerUps) {
+                            if (pu.c === cell.c && pu.r === cell.r && pu.burnTimer === null) {
+                                pu.burnTimer = ITEM_BURN_DELAY;
+                            }
+                        }
+                    }
+                }
+
+                this.enemies = this.enemies.filter(m => m.hp > 0);
+
+                // --- Bricks: break after BRICK_BREAK_DELAY, then drop the item at once ---
+                for (let i = this.burningBricks.length - 1; i >= 0; i--) {
+                    const bb = this.burningBricks[i];
+                    bb.timer -= dt;
+                    if (bb.timer <= 0) {
+                        this.burningBricks.splice(i, 1);
+                        this.map.grid[bb.c][bb.r] = TILE_EMPTY;
+                        if (bb.c === this.key.c && bb.r === this.key.r) {
+                            this.key.dropped = true; // The key brick always drops the key
+                        } else {
+                            this.spawnPowerUp(bb.c, bb.r);
+                        }
+                    }
+                }
+
+                // Update input tracker
+                Object.assign(prevKeys, keys);
+            }
+
+            draw() {
+                this.ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+                this.map.draw(this.ctx);
+
+                // Bricks that are about to break flicker so the delay reads clearly
+                for (const bb of this.burningBricks) {
+                    const a = 0.25 + 0.25 * Math.abs(Math.sin(bb.timer * 30));
+                    this.ctx.fillStyle = `rgba(239, 68, 68, ${a})`;
+                    this.ctx.fillRect(bb.c * TILE_SIZE, bb.r * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+                }
+
+                // Exit door (visible once its brick is gone; open only with the key)
+                if (this.map.grid[this.door.c][this.door.r] !== TILE_BRICK) {
+                    const doorX = this.door.c * TILE_SIZE;
+                    const doorY = this.door.r * TILE_SIZE;
+                    const open = this.hasKey;
+                    this.ctx.fillStyle = open ? '#16a34a' : '#7f1d1d';
+                    this.ctx.fillRect(doorX + 4, doorY + 4, TILE_SIZE - 8, TILE_SIZE - 8);
+                    this.ctx.fillStyle = open ? '#bbf7d0' : '#fca5a5';
+                    this.ctx.fillRect(doorX + 10, doorY + 10, TILE_SIZE - 20, TILE_SIZE - 20);
+                    this.ctx.fillStyle = '#000';
+                    this.ctx.font = 'bold 9px sans-serif';
+                    this.ctx.textAlign = 'center';
+                    this.ctx.fillText(open ? 'EXIT' : 'LOCK', doorX + 20, doorY + 24);
+                }
+
+                // Draw PowerUps
+                for (let pu of this.powerUps) {
+                    this.ctx.globalAlpha = (pu.burnTimer !== null && Math.floor(pu.burnTimer * 20) % 2 === 0) ? 0.35 : 1;
+                    const x = pu.c * TILE_SIZE + 10;
+                    const y = pu.r * TILE_SIZE + 10;
+                    
+                    let color = '#fff', label = '';
+                    switch(pu.type) {
+                        case 'BOMB_CAPACITY': color = '#3b82f6'; label = '+B'; break;
+                        case 'FIRE_RANGE': color = '#f97316'; label = '+R'; break;
+                        case 'SPEED_BOOST': color = '#22c55e'; label = '+S'; break;
+                        case 'SHIELD': color = '#eab308'; label = 'SH'; break;
+                    }
+                    this.ctx.fillStyle = color;
+                    this.ctx.fillRect(x, y, 20, 20);
+                    this.ctx.fillStyle = '#000';
+                    this.ctx.font = '10px Inter font-bold';
+                    this.ctx.textAlign = 'center';
+                    this.ctx.fillText(label, x + 10, y + 14);
+                }
+                this.ctx.globalAlpha = 1;
+
+                // Key (appears when its brick breaks; fire can't burn it)
+                if (this.key.dropped && !this.hasKey) {
+                    const kx = this.key.c * TILE_SIZE + 20;
+                    const ky = this.key.r * TILE_SIZE + 20 + Math.sin(performance.now() / 200) * 2;
+                    this.ctx.fillStyle = '#facc15';
+                    this.ctx.beginPath();
+                    this.ctx.arc(kx, ky, 11, 0, Math.PI * 2);
+                    this.ctx.fill();
+                    this.ctx.strokeStyle = '#a16207';
+                    this.ctx.lineWidth = 2;
+                    this.ctx.stroke();
+                    this.ctx.fillStyle = '#000';
+                    this.ctx.font = 'bold 12px sans-serif';
+                    this.ctx.textAlign = 'center';
+                    this.ctx.fillText('K', kx, ky + 4);
+                }
+
+                // Draw Bombs
+                for (let b of this.bombs) {
+                    const cx = b.c * TILE_SIZE + 20;
+                    const cy = b.r * TILE_SIZE + 20;
+                    
+                    // Pulse logic based on timer
+                    const scale = 1 + Math.sin(b.timer * 10) * 0.1;
+                    
+                    sprites.draw(this.ctx, 'bomb', cx, cy, scale);
+                }
+
+                // Draw Fires
+                for (let f of this.fires) {
+                    for (let cell of f.cells) {
+                        const px = cell.c * TILE_SIZE;
+                        const py = cell.r * TILE_SIZE;
+                        this.ctx.fillStyle = 'rgba(249, 115, 22, 0.8)'; // Orange
+                        this.ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+                        this.ctx.fillStyle = 'rgba(239, 68, 68, 0.9)'; // Red core
+                        this.ctx.fillRect(px + 8, py + 8, TILE_SIZE - 16, TILE_SIZE - 16);
+                    }
+                }
+
+                // Draw enemies: both variants share the Enemy model
+                for (const m of this.enemies) {
+                    this.ctx.globalAlpha = m.stun > 0 ? 0.45 : 1; // Dimmed while standing still
+                    sprites.draw(this.ctx, m.type, m.x, m.y); // model 'neutral' or 'hostile'
+                    if (m.type === 'hostile' && m.aggro) {
+                        this.ctx.fillStyle = '#fde047';
+                        this.ctx.font = 'bold 14px sans-serif';
+                        this.ctx.textAlign = 'center';
+                        this.ctx.fillText('!', m.x, m.y - 16);
+                    }
+                }
+                this.ctx.globalAlpha = 1;
+
+                // Draw Player (flickers while invulnerable after a hit)
+                if (!this.isGameOver) {
+                    const hurt = this.player.invulnTimer;
+                    if (hurt <= 0 || Math.floor(hurt * 15) % 2 === 0) {
+                        sprites.draw(this.ctx, 'player', this.player.x, this.player.y);
+
+                        // Shield ring; blinks during the last 2 seconds as a warning
+                        const sh = this.player.stats.shieldTimer;
+                        if (sh > 0 && (sh > 2 || Math.floor(sh * 6) % 2 === 0)) {
+                            this.ctx.strokeStyle = '#eab308';
+                            this.ctx.lineWidth = 2;
+                            this.ctx.beginPath();
+                            this.ctx.arc(this.player.x, this.player.y, this.player.hitboxRadius + 4, 0, Math.PI * 2);
+                            this.ctx.stroke();
+                        }
+                    }
+                }
+            }
+
+            loop(timestamp) {
+                let frame = (timestamp - this.lastTime) / 1000;
+                this.lastTime = timestamp;
+                if (frame > 0.25) frame = 0.25; // Hidden tab: pause instead of fast-forwarding
+
+                // Fixed timestep: every tick is exactly STEP seconds, so timers don't
+                // depend on the frame rate (a 4 s fuse is exactly 480 ticks).
+                this.accumulator += frame;
+                while (this.accumulator >= STEP) {
+                    this.update(STEP);
+                    this.accumulator -= STEP;
+                }
+                this.draw();
+
+                requestAnimationFrame(t => this.loop(t));
+            }
+        }
+
+        window.onload = () => new Game();
+    </script>
+</body>
+</html>
